@@ -22,6 +22,45 @@ import matplotlib.pyplot as plt
 produce_to_buy = 'bicycle'
 
 def run_model(model, tokenizer, product_to_buy, temperature=0.6, head_pos = [], num_run = 100):
+    
+    """
+    Run Llama 3 with head-pruning to generate price estimates for a specified product
+
+    Parameters:
+    - model: Llama 3
+    - tokenizer: Llama 3 tokenizer
+    - product_to_buy: A string specifying the product for which the initial offer estimate is needed.
+    - temperature: Model temperature
+    - head_pos: A list of tuples specifying which attention heads to zero out, where each tuple contains 
+      (layer_index, head_index). The heads in the specified layers will be set to zero before running the model.
+    - num_run: An integer specifying the number of times the model should be run to generate multiple outputs 
+      (default is 100).
+
+    Returns:
+    - head_count_white: Attention scores related to white names
+    - outputs_white: Model outpuers related to white names
+    - head_count_black: Model outpuers related to black names
+    - outputs_black: Attention scores related to black names
+
+    Detailed Steps:
+    
+    1. **Zero Out Attention Heads**:
+       - Stores the original weights of these heads to restore them later.
+       - Zeroes out the weights in the specified layers and heads
+
+    2. **Generate Outputs**:
+       - Iterates over the predefined list of names 
+       - For each name, constructs a prompt message asking for an initial offer price estimate for a specific 
+         product.
+       - Converts the input message into model-compatible tensors using the tokenizer.
+       - Repeats the model run `num_run` times to account for variability and randomness in output generation.
+       
+    3. **Restore Original Attention Weights **:
+       - After generating all outputs, restores the original attention head weights from the backup to ensure 
+         that the model returns to its initial state for further use or experiments.
+       - Verifies that the weights have been correctly restored by comparing checksums.
+    """
+    
     head_count_white = []
     outputs_white = []
     output_probs_white = []
@@ -34,11 +73,11 @@ def run_model(model, tokenizer, product_to_buy, temperature=0.6, head_pos = [], 
         print(f'Zeroing out {len(head_pos)}')
         per_head_size = 128
 
-        # store the original weights
+        # Store the original weights
         backup = []  
         sum_original = model.model.layers[head_pos[0][0]].self_attn.q_proj.weight.data[head_pos[0][1]*128:head_pos[0][1]*128+128,:].sum()
 
-        # pruned heads
+        # Zero-out heads
         for layer_index, head_index in head_pos:
 
             layer = model.model.layers[layer_index].self_attn
@@ -62,13 +101,12 @@ def run_model(model, tokenizer, product_to_buy, temperature=0.6, head_pos = [], 
             output_probs = []
             attentions = []
 
+            # Tokenizer the input message
             input_tensor = tokenizer.apply_chat_template(
                 messages,
                 add_generation_prompt=True,
                 return_tensors="pt"
             ).to(model.device)
-            past_kv = None
-            max_length = input_tensor.shape[1] + 10
 
             with torch.no_grad():
                 output = model.generate(
@@ -84,21 +122,22 @@ def run_model(model, tokenizer, product_to_buy, temperature=0.6, head_pos = [], 
 
             generated_sequence = output.sequences[0]
 
-            if len(generated_sequence) > max_length-2:
-                continue
-
             attentions_tuple = output.attentions
 
             decoded_output = tokenizer.decode(generated_sequence[input_tensor.shape[1]:], skip_special_tokens=True)
 
+            # Find the indices of the name
             name_start = input_tensor[0].tolist().index(505) + 1
             name_end = input_tensor[0].tolist().index(40665) - 1
 
             # Process attentions for generated tokens (self-attention at each generation step)
             decoder_attentions = []
             for i in range(1, len(attentions_tuple)):
+                # Extract the attention scores related to the name
                 stage_attention = np.array([x.cpu().to(torch.float32).numpy() for x in attentions_tuple[i]])[:,:,:,:,name_start:name_end]
+                # Average the attention scores across the name's tokens
                 decoder_attentions.append(stage_attention.mean(axis=-1).squeeze(1))
+            # Concatenate all processed attentions
             decoder_attentions = np.concatenate(decoder_attentions, axis=-1)
 
 
@@ -109,7 +148,7 @@ def run_model(model, tokenizer, product_to_buy, temperature=0.6, head_pos = [], 
                 head_count_black.append((encoder_attention, decoder_attentions))
                 outputs_black.append(decoded_output)
 
-    # restore pruned heads to original weights for next iteration
+    # Restore pruned heads to original weights for next iteration
     i = 0
     if head_pos:
         print(f'Restoring {len(head_pos)}')
@@ -125,13 +164,14 @@ def run_model(model, tokenizer, product_to_buy, temperature=0.6, head_pos = [], 
             layer.q_proj.weight.data[start_index:end_index, :] = backup[i]
             i+=1
         
-        # check if successfully restored the original weights
+        # Check if successfully restored the original weights
         check_sum = model.model.layers[head_pos[0][0]].self_attn.q_proj.weight.data[head_pos[0][1]*128:head_pos[0][1]*128+128,:].sum()
         assert check_sum==sum_original, f'restroing failed: {check_sum} {sum_original}'
         
     return head_count_white, outputs_white, head_count_black, outputs_black
 
 
+# Visualize a 2d matrix, such as a 32*32 attention score matrix
 def plot_attention_map(diff_matrix):
                         
     fig, axs = plt.subplots(1, 2, figsize=(12, 6))
@@ -151,17 +191,22 @@ def plot_attention_map(diff_matrix):
     plt.tight_layout()
     plt.show()
     # return fig
-    
+
+# Sort values and corresponding indices in a 2d matrix
 def extract_head_indices(diff_matrix):
 
     flattened_matrix = diff_matrix.flatten()
     sorted_indices_flat = np.argsort(-flattened_matrix)
+    
+    # Convert the flattened indices back to 2D indices of the original matrix
     sorted_indices = [np.unravel_index(idx, diff_matrix.shape) for idx in sorted_indices_flat]
+    
+    # Get the sorted values from the sorted indices
     sorted_values = flattened_matrix[sorted_indices_flat]
 
     return sorted_indices, sorted_values
 
-
+# Translate string output like "$1,200" into float 1200
 def extract_numbers(lst):
     nums = []
     for d in lst:
@@ -172,6 +217,7 @@ def extract_numbers(lst):
             nums.append(float(digits))
     return nums
 
+# Winsorize outleirs
 def remove_outliers(data):
     Q1 = np.percentile(data, 1)
     Q3 = np.percentile(data, 99)
